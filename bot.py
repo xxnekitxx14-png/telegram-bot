@@ -1,12 +1,11 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 BOT_TOKEN = "7775197329:AAE0yd3a5qJu-E46HX72TN4Y4zNLcslXweU"
@@ -20,7 +19,7 @@ GROUPS = {
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher(bot, storage=storage)
 scheduler = AsyncIOScheduler()
 message_buffer = {}
 
@@ -31,36 +30,36 @@ def is_active_time():
     return 20 <= datetime.now().hour <= 23
 
 def group_keyboard():
-    buttons = [[InlineKeyboardButton(text=g["name"], callback_data=f"group_{key}")] for key, g in GROUPS.items()]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    keyboard = types.InlineKeyboardMarkup()
+    for key, g in GROUPS.items():
+        keyboard.add(types.InlineKeyboardButton(text=g["name"], callback_data=f"group_{key}"))
+    return keyboard
 
-@dp.message(Command("start", "help"))
-async def cmd_help(message: Message):
-    if message.chat.type == "private":
-        await message.answer("👋 Привет!\n\n📨 Напиши сообщение — выберу группу кнопкой\n\n⏰ /schedule 21:00 акулы Текст\n⏰ /schedule 21:00 стат Текст\n\n📋 Каждый час с 20:00 до 00:00 шлю сводку")
+@dp.message_handler(commands=["start", "help"], chat_type="private")
+async def cmd_help(message: types.Message):
+    await message.answer("👋 Привет!\n\n📨 Напиши сообщение — выберу группу кнопкой\n\n⏰ /schedule 21:00 акулы Текст\n⏰ /schedule 21:00 стат Текст\n\n📋 Каждый час с 20:00 до 00:00 шлю сводку")
 
-@dp.message(F.chat.type == "private", ~F.text.startswith("/"))
-async def ask_group(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+@dp.message_handler(chat_type="private", state="*")
+async def ask_group(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID or message.text.startswith("/"):
         return
     await state.update_data(text=message.text)
-    await state.set_state(SendMessage.waiting_for_group)
+    await SendMessage.waiting_for_group.set()
     await message.answer("📤 В какую группу отправить?", reply_markup=group_keyboard())
 
-@dp.callback_query(F.data.startswith("group_"), SendMessage.waiting_for_group)
-async def send_to_group(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query_handler(lambda c: c.data.startswith("group_"), state=SendMessage.waiting_for_group)
+async def send_to_group(callback: types.CallbackQuery, state: FSMContext):
     key = callback.data.replace("group_", "")
     group = GROUPS.get(key)
     if not group:
-        await callback.answer("❌ Группа не найдена")
         return
     data = await state.get_data()
     await bot.send_message(chat_id=group["id"], text=data.get("text", ""))
     await callback.message.edit_text(f"✅ Отправлено в «{group['name']}»!")
-    await state.clear()
+    await state.finish()
 
-@dp.message(Command("schedule"))
-async def cmd_schedule(message: Message):
+@dp.message_handler(commands=["schedule"], chat_type="private")
+async def cmd_schedule(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split(" ", 3)
@@ -81,20 +80,20 @@ async def cmd_schedule(message: Message):
     send_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if send_time <= now:
         send_time += timedelta(days=1)
-    scheduler.add_job(send_scheduled_message, "date", run_date=send_time, args=[group["id"], text])
+    scheduler.add_job(send_scheduled, "date", run_date=send_time, args=[group["id"], text])
     await message.answer(f"⏰ Запланировано на {time_str} в «{group['name']}»:\n{text}")
 
-async def send_scheduled_message(chat_id, text):
+async def send_scheduled(chat_id, text):
     await bot.send_message(chat_id=chat_id, text=text)
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}) & ~F.text.startswith("/"))
-async def collect_message(message: Message):
+@dp.message_handler(chat_type=["group", "supergroup"])
+async def collect_message(message: types.Message):
     if not is_active_time():
         return
     chat_id = message.chat.id
     if chat_id not in message_buffer:
         message_buffer[chat_id] = {"title": message.chat.title or "Группа", "lines": []}
-    message_buffer[chat_id]["lines"].append(message.text or message.caption or "📎 Медиафайл")
+    message_buffer[chat_id]["lines"].append(message.text or "📎 Медиафайл")
 
 async def send_hourly_digest():
     while True:
@@ -115,10 +114,9 @@ async def send_hourly_digest():
                 await bot.send_message(chat_id=ADMIN_ID, text=full_text[i:i+4000])
         message_buffer.clear()
 
-async def main():
+async def on_startup(dp):
     scheduler.start()
-    print("✅ Бот запущен!")
-    await asyncio.gather(dp.start_polling(bot), send_hourly_digest())
+    asyncio.create_task(send_hourly_digest())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, on_startup=on_startup)
